@@ -1,0 +1,422 @@
+#training script
+import os
+import pandas as pd
+import boto3
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
+import s3fs
+import numpy as np
+import matplotlib.pyplot as plt
+import io
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, BatchNormalization, Rescaling, RandomFlip, RandomRotation, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, Callback
+
+# S3 Bucket information
+bucket_name = 'prediction-tumor'
+train_prefix = 'brain/Training'
+test_prefix = 'brain/Testing'
+
+# Image size and batch size
+img_size = (224, 224)  # Resize images to (224, 224) for the model
+batch_size = 32  # Define batch size for training
+
+# Initialize the S3 client
+s3 = boto3.client('s3')
+
+# Function to list all files in a given S3 prefix (directory)
+def list_files_in_s3(prefix):
+    files = []
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    
+    while response.get('Contents'):
+        for item in response['Contents']:
+            files.append(item['Key'])
+        
+        if response.get('IsTruncated'):  
+            response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix, ContinuationToken=response['NextContinuationToken'])
+        else:
+            break
+
+    return files
+
+# Prepare the image DataFrame from S3
+def prepare_image_df_s3(prefix):
+    labels = []
+    images = []
+    
+    folder_files = list_files_in_s3(prefix)
+    
+    print(f"Files in {prefix}: {len(folder_files)} found.")
+    
+    for file_path in folder_files:
+        label = file_path.split('/')[2]  # The folder name is the label (e.g., Training/glioma/)
+        labels.append(label)
+        s3_path = f"s3://{bucket_name}/{file_path}"
+        images.append(s3_path)
+    
+    df = pd.DataFrame({
+        'Img_path': images,  # Full S3 URLs
+        'Img_label': labels
+    })
+
+    return df
+
+# Prepare train and test DataFrames
+train_df = prepare_image_df_s3(train_prefix)
+test_df = prepare_image_df_s3(test_prefix)
+
+# Split test data into validation and testing sets
+valid_data, test_data = train_test_split(test_df, train_size=0.5, shuffle=True, random_state=42)
+
+# Ensure paths are strings
+train_df['Img_path'] = train_df['Img_path'].astype(str)
+valid_data['Img_path'] = valid_data['Img_path'].astype(str)
+test_data['Img_path'] = test_data['Img_path'].astype(str)
+
+# Ensure labels are strings
+train_df['Img_label'] = train_df['Img_label'].astype(str)
+valid_data['Img_label'] = valid_data['Img_label'].astype(str)
+test_data['Img_label'] = test_data['Img_label'].astype(str)
+
+# Custom image loader for S3 images
+def load_s3_image(path, target_size):
+    s3 = s3fs.S3FileSystem(anon=False)
+    
+    with s3.open(path, 'rb') as file:
+        image_bytes = file.read()
+        img = load_img(io.BytesIO(image_bytes), target_size=target_size)
+    
+    return img_to_array(img)
+
+# Custom generator to load images from S3 for the ImageDataGenerator
+def s3_image_generator(df, batch_size, img_size, class_indices, shuffle=True):
+    num_samples = len(df)
+    
+    while True:
+        if shuffle:
+            df = df.sample(frac=1).reset_index(drop=True)  # Shuffle the data at the start of each epoch
+        
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            batch_paths = df['Img_path'].iloc[start:end].values
+            batch_labels = df['Img_label'].iloc[start:end].values
+
+            images = [load_s3_image(path, img_size) for path in batch_paths]
+            labels = np.array([class_indices.get(label, -1) for label in batch_labels])
+            
+            if -1 in labels:  # Skip batches with unknown labels
+                continue
+
+            labels = np.eye(len(class_indices))[labels]  # One-hot encoding
+
+            yield np.array(images), labels
+
+# Get class indices
+class_indices = {label: idx for idx, label in enumerate(train_df['Img_label'].unique())}
+class_count = len(class_indices)  # Number of classes
+
+# Steps per epoch and validation steps
+steps_per_epoch = len(train_df) // batch_size
+validation_steps = len(valid_data) // batch_size
+test_steps = len(test_data) // batch_size
+
+# Create custom generators with shuffle for train and valid generators
+train_generator = s3_image_generator(train_df, batch_size=batch_size, img_size=img_size, class_indices=class_indices, shuffle=True)
+valid_generator = s3_image_generator(valid_data, batch_size=batch_size, img_size=img_size, class_indices=class_indices, shuffle=True)
+
+# Test generator (without shuffling)
+test_generator = s3_image_generator(test_data, batch_size=batch_size, img_size=img_size, class_indices=class_indices, shuffle=False)
+
+# Function to plot a batch of images with their corresponding labels
+def plot_batch(images, labels, class_indices, num_columns=5):
+    """
+    Function to plot a batch of images with their corresponding labels.
+    
+    Parameters:
+    - images: A batch of images (numpy array).
+    - labels: A batch of labels (numpy array).
+    - class_indices: Dictionary mapping class indices to class labels.
+    - num_columns: Number of columns in the plot grid.
+    """
+    num_images = len(images)
+    num_rows = (num_images // num_columns) + int(num_images % num_columns > 0)
+
+    plt.figure(figsize=(num_columns * 3, num_rows * 3))
+
+    for i in range(num_images):
+        plt.subplot(num_rows, num_columns, i + 1)
+        plt.imshow(images[i].astype('uint8'))
+        true_label = np.argmax(labels[i])  # One-hot encoded label
+        label_text = list(class_indices.keys())[true_label]
+        plt.title(label_text)
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+# Display class count and class indices before training
+print(f"Number of classes: {class_count}")
+print("Class indices:", class_indices)
+
+# Plot a batch from the training generator before model training
+images_batch, labels_batch = next(train_generator)
+plot_batch(images_batch, labels_batch, class_indices)
+
+# Model definition
+from tensorflow.keras.layers import Input
+
+model = Sequential([
+    Input(shape=(224, 224, 3)),
+    Rescaling(1./255.),
+    
+    RandomFlip('horizontal'),
+    RandomRotation(0.2),
+
+    Conv2D(filters=16, kernel_size=(3,3), activation='relu', name='Conv2D_1'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Conv2D(filters=32, kernel_size=(3,3), activation='relu', name='Conv2D_2'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Conv2D(filters=64, kernel_size=(3,3), activation='relu', name='Conv2D_3'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Conv2D(filters=128, kernel_size=(3,3), activation='relu', name='Conv2D_4'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    
+    Flatten(),
+    
+    Dense(units=32, activation='relu'),
+    Dense(units=64, activation='relu'),
+    Dense(units=128, activation='relu'),
+    
+    Dense(units=256, activation='relu'),
+    Dense(units=128, activation='relu'),
+    Dense(units=class_count, activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Callbacks
+ES = EarlyStopping(monitor='val_accuracy', patience=10, verbose=2, restore_best_weights=True, mode='max', min_delta=0)
+MP = ModelCheckpoint(filepath='/tmp/Best_model.keras', monitor='val_accuracy', verbose=2, save_best_only=True, mode='max')
+RP = ReduceLROnPlateau(monitor='val_loss', patience=5, verbose=2, min_lr=0.0001, factor=0.2)
+
+# Model training
+history = model.fit(
+    train_generator,
+    validation_data=valid_generator,
+    epochs=50,
+    steps_per_epoch=steps_per_epoch,
+    validation_steps=validation_steps,
+    callbacks=[ES, RP],
+)
+
+# Save model in SavedModel format
+model_save_path = '/opt/ml/model/1'
+os.makedirs(model_save_path, exist_ok=True)
+model.save(model_save_path)
+
+# Evaluate on test data
+test_loss, test_acc = model.evaluate(test_generator, steps=test_steps, verbose=2)
+print(f'\nTest accuracy: {test_acc}')
+########################################################
+#training job
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.tensorflow import TensorFlow
+
+# Set up SageMaker session and role
+sagemaker_session = sagemaker.Session()
+role = get_execution_role()
+
+# Specify your S3 paths for training and validation data
+train_data_s3 = 's3://prediction-tumor/brain/Training/'
+valid_data_s3 = 's3://prediction-tumor/brain/Testing/'
+
+# Create the TensorFlow Estimator
+estimator = TensorFlow(
+    entry_point='train.py',  # Path to the script (can be local or S3)
+    role=role,
+    instance_count=1,  # Use 1 instance for training
+    instance_type='ml.m5.xlarge',  # Instance type (adjust as per requirement)
+    output_path='s3://prediction-tumor/data/output',  # S3 path to save the model
+    framework_version='2.12.0',  # TensorFlow version
+    py_version='py310',  # Python version
+    hyperparameters={
+        'batch_size': 32,  # Hyperparameter: batch size
+        'epochs': 50  # Hyperparameter: epochs
+    },
+    sagemaker_session=sagemaker_session
+)
+
+# Specify the inputs for the estimator, the training and validation data
+inputs = {
+    'train': train_data_s3,  # S3 path for the training data
+    'validation': valid_data_s3  # S3 path for the validation data
+}
+
+# Start the training job
+estimator.fit(inputs)
+#######################################################
+# lambda_function.py
+import json
+import boto3
+from PIL import Image
+import io
+import os
+import numpy as np
+import s3fs
+
+# Initialize SageMaker runtime client
+runtime_client = boto3.client('sagemaker-runtime', region_name='ap-south-1')
+ses_client = boto3.client('ses', region_name='ap-south-1')
+
+# Define class labels and their mapping
+class_indices = {'glioma': 0, 'meningioma': 1, 'notumor': 2, 'pituitary': 3}
+class_labels = list(class_indices.keys())
+
+# Get SageMaker Endpoint Name and S3 Bucket from environment variables
+endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME', 'default-endpoint')
+s3_bucket_name = os.environ.get('S3_BUCKET_NAME', 'default-bucket')
+
+# Function to preprocess image from S3 before sending it to SageMaker
+def preprocess_image_from_s3(image_path, target_size=(224, 224)):
+    """Load an image from S3, preprocess it, and return a numpy array."""
+    s3 = s3fs.S3FileSystem(anon=False)
+    try:
+        with s3.open(image_path, 'rb') as file:
+            image_bytes = file.read()
+            # Use Pillow to open and resize the image
+            img = Image.open(io.BytesIO(image_bytes))
+            img = img.resize(target_size)
+    except Exception as e:
+        print(f"Failed to load or process image from S3: {e}")
+        raise e
+    img_array = np.array(img)  # Convert image to numpy array
+    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension (1, 224, 224, 3)
+    return img_array
+
+# Function to make prediction using SageMaker Endpoint
+def predict_with_endpoint(image, endpoint_name):
+    """Send image to SageMaker endpoint and get predictions."""
+    payload = json.dumps(image.tolist())
+    
+    try:
+        # Call the endpoint
+        response = runtime_client.invoke_endpoint(
+            EndpointName=endpoint_name,
+            ContentType='application/json',
+            Body=payload
+        )
+
+        status_code = response['ResponseMetadata']['HTTPStatusCode']
+        if status_code == 200:
+            result = json.loads(response['Body'].read().decode())
+            return result
+        else:
+            raise Exception(f"Error in prediction. Status code: {status_code}")
+    
+    except Exception as e:
+        print(f"Failed to predict with endpoint: {e}")
+        raise e
+
+# Function to extract predicted class from model's output
+def extract_prediction(prediction, class_indices):
+    """Extract the predicted class and its confidence from model output."""
+    if isinstance(prediction, dict) and 'predictions' in prediction:
+        prediction_probs = prediction['predictions'][0]
+    else:
+        raise ValueError("Unexpected prediction format.")
+    
+    predicted_class_idx = np.argmax(prediction_probs)
+    predicted_label = class_labels[predicted_class_idx]
+    confidence = prediction_probs[predicted_class_idx]
+    return predicted_label, confidence
+
+# Function to send an email via SES
+def send_email(email, predicted_label, confidence):
+    try:
+        response = ses_client.send_email(
+            Source="christeenasony99@gmail.com",  # Replace with your verified sender email
+            Destination={
+                'ToAddresses': [email]
+            },
+            Message={
+                'Subject': {
+                    'Data': 'Prediction Results'
+                },
+                'Body': {
+                    'Text': {
+                        'Data': f"Prediction: {predicted_label}\nConfidence: {confidence}"
+                    }
+                }
+            }
+        )
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+# Lambda handler
+def lambda_handler(event, context):
+    """Handle an API Gateway request to predict an image."""
+    try:
+        print(f"Received event: {json.dumps(event)}")  # Log the event for debugging
+
+        # Check if the event contains a body
+        if 'body' not in event:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Invalid request format: Missing body in the event.')
+            }
+
+        body = json.loads(event['body'])
+        email = body.get('email')
+        image_path = body.get('image_path')
+        
+        if not email or not image_path:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing email or image path in the request.')
+            }
+
+        # Preprocess image from S3 bucket
+        print("Preprocessing image from S3...")
+        image = preprocess_image_from_s3(image_path)
+        
+        # Call SageMaker endpoint to get prediction
+        print("Calling SageMaker endpoint...")
+        prediction = predict_with_endpoint(image, endpoint_name)
+        
+        if prediction:
+            # Extract the prediction label and confidence
+            print("Extracting prediction...")
+            predicted_label, confidence = extract_prediction(prediction, class_indices)
+            
+            # Send the result via email
+            send_email(email, predicted_label, confidence)
+            
+            # Return the prediction in the response
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'email': email,
+                    'predicted_label': predicted_label,
+                    'confidence': confidence
+                })
+            }
+        else:
+            print("Failed to get prediction from SageMaker.")
+            return {
+                'statusCode': 500,
+                'body': json.dumps('Failed to get prediction from SageMaker.')
+            }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Internal Server Error')
+        }
